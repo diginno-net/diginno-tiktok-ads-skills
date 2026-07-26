@@ -86,10 +86,17 @@ references/
   source-analysis.md
   tiktok-report-metrics.md
   mutation-gate.md
+  case-studies.md
 scripts/
   install-to-opencode.sh
   validate-skills.sh
 ```
+
+## Case studies
+
+Xem [references/case-studies.md](references/case-studies.md) để có danh sách case ứng dụng MCP:
+smoke test OAuth, report insight, creative review, zero-conversion diagnosis, budget pacing,
+pre-launch QA, Shop/GMV Max readiness, handover audit, anomaly monitor và sales demo.
 
 ## License
 
