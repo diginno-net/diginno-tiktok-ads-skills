@@ -100,12 +100,12 @@ pre-launch QA, Shop/GMV Max readiness, handover audit, anomaly monitor và sales
 
 ## Sample HTML reports
 
-Các output HTML mẫu dùng dữ liệu thật đọc từ official TikTok Ads MCP, đã sanitize ở mức không chứa
-token/secret:
+Các output HTML mẫu dùng dữ liệu thật đọc từ official TikTok Ads MCP, đã ẩn thông tin khách hàng
+và mã định danh để có thể dùng làm demo công khai:
 
-- [HUGAN executive report](reports/html/hugan-executive-report.html)
-- [HUGAN optimization board](reports/html/hugan-optimization-board.html)
-- [HUGAN creative signal board](reports/html/hugan-creative-signal-board.html)
+- [Demo executive report](reports/html/demo-executive-report.html)
+- [Demo optimization board](reports/html/demo-optimization-board.html)
+- [Demo creative signal board](reports/html/demo-creative-signal-board.html)
 
 ## License
 
