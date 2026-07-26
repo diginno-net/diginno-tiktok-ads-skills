@@ -98,6 +98,15 @@ Xem [references/case-studies.md](references/case-studies.md) để có danh sác
 smoke test OAuth, report insight, creative review, zero-conversion diagnosis, budget pacing,
 pre-launch QA, Shop/GMV Max readiness, handover audit, anomaly monitor và sales demo.
 
+## Sample HTML reports
+
+Các output HTML mẫu dùng dữ liệu thật đọc từ official TikTok Ads MCP, đã sanitize ở mức không chứa
+token/secret:
+
+- [HUGAN executive report](reports/html/hugan-executive-report.html)
+- [HUGAN optimization board](reports/html/hugan-optimization-board.html)
+- [HUGAN creative signal board](reports/html/hugan-creative-signal-board.html)
+
 ## License
 
 MIT. Xem `NOTICE.md` để biết nguồn cảm hứng/OSS đã tham khảo.
