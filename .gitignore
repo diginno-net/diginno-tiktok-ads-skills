@@ -13,3 +13,4 @@ dist/
 build/
 tmp/
 reports/private/
+.wrangler/
