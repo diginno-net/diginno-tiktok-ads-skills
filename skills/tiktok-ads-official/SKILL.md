@@ -36,6 +36,26 @@ Use the official TikTok Ads MCP configured in Codex. Do not ask for, store, past
 
 Read `references/tool-map.md` when mapping a task to official MCP tools.
 
+## CLI fallback when the MCP namespace is not loaded
+
+Use `mcp__tiktok_ads.*` tools when they exist in the session. When they do not
+(ZCode sessions, or Codex with the server trimmed/disabled to save tokens), use
+the local CLI — it calls the same official MCP endpoint:
+
+```bash
+tiktok-ads-mcp status        # token state, no network call
+tiktok-ads-mcp whoami        # user_info_get
+tiktok-ads-mcp advertisers   # auth_advertiser_get
+tiktok-ads-mcp tools         # list tools (also measures the token surface)
+tiktok-ads-mcp call <tool> --params '{"advertiser_id":"7..."}'
+```
+
+- Binary `~/.local/bin/tiktok-ads-mcp`; source `diginno-tiktok-ads-skills/cli/tiktok-ads-mcp`.
+- Credentials shared per machine at `~/.config/tiktok-ads-mcp/credentials.json`
+  (0600, auto-refreshed). If missing, ask the user to run `tiktok-ads-mcp login`
+  once (browser OAuth). Never print the credentials file or its tokens.
+- Same mutation guardrails: draft plan + explicit approval before write tools.
+
 ## Output shape
 
 For normal reads, answer in Vietnamese with:

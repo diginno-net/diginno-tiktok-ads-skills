@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""tiktok-ads-mcp — CLI gọi TikTok Ads official MCP (tt-ads-mcp-flat).
+
+Mục đích: dùng TikTok Ads MCP qua terminal mà KHÔNG cần nạp MCP vào
+agent (không tốn token cho tool definitions mỗi phiên).
+
+Cách hoạt động:
+  - OAuth 2.1 (Dynamic Client Registration + PKCE) một lần bằng `login`.
+  - Token lưu tại ~/.config/tiktok-ads-mcp/credentials.json (0600), tự refresh.
+  - Mỗi lệnh mở một MCP session ngắn (initialize -> gọi -> kết thúc).
+
+Lệnh chính:
+  login            Đăng nhập OAuth qua browser (chạy 1 lần)
+  status           Xem trạng thái token local (không gọi mạng)
+  logout           Xoá token local (kèm revoke trên server nếu được)
+  whoami           Gọi tool user_info_get
+  advertisers      Gọi tool auth_advertiser_get (danh sách tài khoản quảng cáo)
+  tools            Liệt kê tools của official MCP
+  call <tool>      Gọi tool bất kỳ với tham số JSON
+
+Không chứa app secret. Token không bao giờ in ra stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import http.server
+import json
+import os
+import secrets
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+DEFAULT_ENDPOINT = "https://business-api.tiktok.com/open_mcp/tt-ads-mcp-flat"
+SCOPE = "mcp:tt4b"
+CALLBACK_PATH = "/callback"
+CLIENT_NAME = "diginno-tiktok-ads-mcp-cli"
+
+CONFIG_DIR = os.environ.get(
+    "TIKTOK_ADS_MCP_CONFIG_DIR", os.path.expanduser("~/.config/tiktok-ads-mcp")
+)
+CREDENTIALS_PATH = os.path.join(CONFIG_DIR, "credentials.json")
+PENDING_PATH = os.path.join(CONFIG_DIR, "pending_logins.json")
+LOGIN_TIMEOUT = int(os.environ.get("TIKTOK_ADS_MCP_LOGIN_TIMEOUT", "300"))
+USER_AGENT = "diginno-tiktok-ads-mcp-cli/1.0"
+
+
+class McpError(Exception):
+    """Lỗi chung khi nói chuyện với MCP/oauth endpoint."""
+
+
+class AuthRequired(McpError):
+    """Cần đăng nhập lại (chưa login, token/refresh hết hạn)."""
+
+
+# --------------------------------------------------------------------------
+# HTTP helpers
+# --------------------------------------------------------------------------
+
+def _http_json(url: str, body=None, headers=None, timeout=30):
+    req_headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    req_headers.update(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        req_headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read()[:400].decode("utf-8", "replace")
+        raise McpError(f"HTTP {e.code} từ {url}: {raw}") from None
+    except urllib.error.URLError as e:
+        raise McpError(f"Không kết nối được {url}: {e.reason}") from None
+
+
+def _http_form(url: str, fields: dict, timeout=30):
+    body = urllib.parse.urlencode({k: v for k, v in fields.items() if v is not None}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read()[:400].decode("utf-8", "replace")
+        raise McpError(f"Token endpoint HTTP {e.code}: {raw}") from None
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+# --------------------------------------------------------------------------
+# OAuth discovery
+# --------------------------------------------------------------------------
+
+def discover(endpoint: str) -> dict:
+    """Đọc metadata OAuth (RFC 9728 + RFC 8414) cho một MCP endpoint."""
+    parts = urllib.parse.urlsplit(endpoint)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    resource_meta = _http_json(origin + "/.well-known/oauth-protected-resource" + parts.path)
+    as_url = (resource_meta.get("authorization_servers") or [None])[0]
+    if not as_url:
+        raise McpError("Resource metadata không có authorization_servers")
+    md = _http_json(as_url.rstrip("/") + "/.well-known/oauth-authorization-server")
+    for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
+        if not md.get(key):
+            raise McpError(f"Thiếu {key} trong authorization server metadata")
+    return md
+
+
+# --------------------------------------------------------------------------
+# Credentials
+# --------------------------------------------------------------------------
+
+def load_credentials():
+    try:
+        with open(CREDENTIALS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        raise McpError(f"Không đọc được {CREDENTIALS_PATH}: {e}") from None
+
+
+def is_logged_in(cred) -> bool:
+    return bool(cred and cred.get("access_token"))
+
+
+def _load_pending() -> list:
+    try:
+        with open(PENDING_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_pending(items: list) -> None:
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = PENDING_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items[-10:], f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, PENDING_PATH)
+
+
+def save_credentials(cred: dict) -> None:
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = CREDENTIALS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cred, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CREDENTIALS_PATH)
+
+
+def refresh_credentials(cred: dict) -> dict:
+    """Làm mới access token nếu sắp/hết hạn. Trả cred (đã lưu)."""
+    exp = cred.get("expires_at") or 0
+    if time.time() < exp - 120:
+        return cred
+    if not cred.get("refresh_token"):
+        raise AuthRequired("Không có refresh token. Chạy: tiktok-ads-mcp login")
+    res = _http_form(
+        cred["token_endpoint"],
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": cred["refresh_token"],
+            "client_id": cred["client_id"],
+            "resource": cred.get("resource", DEFAULT_ENDPOINT),
+        },
+    )
+    if "access_token" not in res:
+        raise AuthRequired("Refresh thất bại. Chạy lại: tiktok-ads-mcp login")
+    cred["access_token"] = res["access_token"]
+    if res.get("refresh_token"):
+        cred["refresh_token"] = res["refresh_token"]
+    cred["expires_at"] = time.time() + int(res.get("expires_in", 86399))
+    if res.get("refresh_token_expires_in"):
+        cred["refresh_expires_at"] = time.time() + int(res["refresh_token_expires_in"])
+    if res.get("scope"):
+        cred["scope"] = res["scope"]
+    cred["refreshed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    save_credentials(cred)
+    return cred
+
+
+# --------------------------------------------------------------------------
+# MCP streamable HTTP client
+# --------------------------------------------------------------------------
+
+class McpClient:
+    def __init__(self, endpoint: str, access_token: str):
+        self.endpoint = endpoint
+        self.access_token = access_token
+        self.session_id = None
+        self._id = 0
+
+    def _post(self, message: dict, timeout=60):
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "Authorization": f"Bearer {self.access_token}",
+            "User-Agent": USER_AGENT,
+        }
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(
+            self.endpoint, data=json.dumps(message).encode("utf-8"), headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                sid = resp.headers.get("Mcp-Session-Id")
+                if sid:
+                    self.session_id = sid
+                return self._parse(resp.read(), resp.headers.get("Content-Type", ""))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise AuthRequired("MCP trả 401 — cần login/refresh") from None
+            raw = e.read()[:400].decode("utf-8", "replace")
+            raise McpError(f"MCP HTTP {e.code}: {raw}") from None
+        except urllib.error.URLError as e:
+            raise McpError(f"Không kết nối được MCP: {e.reason}") from None
+
+    @staticmethod
+    def _parse(raw: bytes, content_type: str):
+        if not raw:
+            return None
+        text = raw.decode("utf-8", "replace")
+        stripped = text.lstrip()
+        if "text/event-stream" in content_type or stripped.startswith(("event:", "data:", ":")):
+            payload = None
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("data:"):
+                    chunk = line[5:].strip()
+                    if chunk and chunk != "[DONE]":
+                        try:
+                            payload = json.loads(chunk)
+                        except json.JSONDecodeError:
+                            continue
+            if payload is None:
+                raise McpError("Không parse được SSE response từ MCP")
+            return payload
+        return json.loads(text)
+
+    def rpc(self, method: str, params=None, notify=False):
+        message = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        if not notify:
+            self._id += 1
+            message["id"] = self._id
+        data = self._post(message)
+        if notify or data is None:
+            return None
+        if "error" in data:
+            err = data["error"]
+            raise McpError(f"{method} lỗi: {err.get('message')} (code {err.get('code')})")
+        return data.get("result")
+
+    def initialize(self):
+        result = self.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": CLIENT_NAME, "version": "1.0.0"},
+            },
+        )
+        self.rpc("notifications/initialized", {}, notify=True)
+        return result
+
+    def list_tools(self):
+        tools, cursor = [], None
+        while True:
+            params = {"cursor": cursor} if cursor else {}
+            res = self.rpc("tools/list", params) or {}
+            tools.extend(res.get("tools", []))
+            cursor = res.get("nextCursor")
+            if not cursor:
+                return tools
+
+    def call_tool(self, name: str, arguments: dict):
+        return self.rpc("tools/call", {"name": name, "arguments": arguments})
+
+
+# --------------------------------------------------------------------------
+# Auth-aware session
+# --------------------------------------------------------------------------
+
+def open_session():
+    """Tạo MCP session đã xác thực. Tự refresh; 401 giữa chừng thì retry 1 lần."""
+    cred = load_credentials()
+    if not is_logged_in(cred):
+        raise AuthRequired(
+            f"Chưa đăng nhập (không thấy token trong {CREDENTIALS_PATH}). Chạy: tiktok-ads-mcp login"
+        )
+    cred = refresh_credentials(cred)
+    endpoint = cred.get("endpoint", DEFAULT_ENDPOINT)
+    client = McpClient(endpoint, cred["access_token"])
+    try:
+        client.initialize()
+        return client
+    except AuthRequired:
+        cred["expires_at"] = 0  # ép refresh
+        cred = refresh_credentials(cred)
+        client = McpClient(endpoint, cred["access_token"])
+        client.initialize()
+        return client
+
+
+# --------------------------------------------------------------------------
+# OAuth login (loopback + PKCE)
+# --------------------------------------------------------------------------
+
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+    server_version = CLIENT_NAME
+    timeout = 5  # socket timeout cho từng connection, tránh treo vì request dở dang
+
+    def log_message(self, *args):  # tắt log ồn
+        pass
+
+    def do_GET(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path != CALLBACK_PATH:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        state = params.get("state", [""])[0]
+        known = state in getattr(self.server, "known_states", set())
+        self.server.callback_params = params
+        self.server.callback_known = known
+        if known:
+            title, color, msg = (
+                "✅ Đăng nhập thành công", "#0a7d33", "Quay lại terminal để tiếp tục."
+            )
+        else:
+            title, color, msg = (
+                "⚠️ Phiên đăng nhập không khớp", "#a15c00",
+                "Tab này thuộc phiên login cũ. Quay lại terminal, dùng URL của phiên mới nhất.",
+            )
+        body = (
+            "<!doctype html><html><head><meta charset='utf-8'><title>TikTok Ads MCP</title></head>"
+            f"<body style='font-family:-apple-system,sans-serif;padding:40px'>"
+            f"<h2 style='color:{color}'>{title}</h2><p>{msg}</p></body></html>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _new_server(port: int):
+    try:
+        httpd = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    except OSError as e:
+        raise McpError(
+            f"Không bind được callback 127.0.0.1:{port} ({e}). "
+            "Giải phóng port này rồi chạy lại: tiktok-ads-mcp login"
+        ) from None
+    httpd.timeout = 1
+    httpd.callback_params = None
+    httpd.callback_known = False
+    httpd.known_states = set()
+    return httpd
+
+
+def _resolve_client(md: dict):
+    """Trả (httpd, client_id, redirect_uri) — tái dùng client đã đăng ký nếu có.
+
+    Lưu ý: DCR của TikTok dedupe theo client_name, có thể trả lại client cũ
+    với redirect_uri khác port mình vừa xin. Khi đó phải bind đúng port đã
+    đăng ký, nếu không authorize/token sẽ lỗi redirect_uri mismatch.
+    """
+    stored = load_credentials() or {}
+    if stored.get("client_id") and stored.get("redirect_uri"):
+        parts = urllib.parse.urlsplit(stored["redirect_uri"])
+        return _new_server(parts.port), stored["client_id"], stored["redirect_uri"]
+
+    try:
+        httpd = _new_server(47823)  # port mặc định, ổn định giữa các lần login
+    except McpError:
+        httpd = _new_server(0)
+    requested = f"http://127.0.0.1:{httpd.server_address[1]}{CALLBACK_PATH}"
+
+    reg = _http_json(
+        md["registration_endpoint"],
+        {
+            "client_name": CLIENT_NAME,
+            "redirect_uris": [requested],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "scope": SCOPE,
+        },
+    )
+    client_id = reg.get("client_id")
+    if not client_id:
+        raise McpError("Đăng ký OAuth client thất bại (thiếu client_id)")
+
+    redirect_uri = (reg.get("redirect_uris") or [requested])[0]
+    if urllib.parse.urlsplit(redirect_uri).path != CALLBACK_PATH:
+        raise McpError(f"redirect_uri đã đăng ký không đúng path: {redirect_uri}")
+    if redirect_uri != requested:
+        httpd.server_close()
+        httpd = _new_server(urllib.parse.urlsplit(redirect_uri).port)
+    return httpd, client_id, redirect_uri
+
+
+def oauth_login(print_url_only=False, no_browser=False, timeout=LOGIN_TIMEOUT) -> dict:
+    endpoint = os.environ.get("TIKTOK_ADS_MCP_ENDPOINT", DEFAULT_ENDPOINT)
+    md = discover(endpoint)
+    httpd, client_id, redirect_uri = _resolve_client(md)
+
+    try:
+        verifier = _b64url(secrets.token_bytes(64))
+        challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+        state = _b64url(secrets.token_bytes(16))
+
+        # Ghi nhớ phiên login (state + PKCE verifier) vào file để callback đến muộn —
+        # kể cả từ tab của lần chạy trước — vẫn đổi được token (giữ 24h, tối đa 10 phiên).
+        now = time.time()
+        pending = [
+            p for p in _load_pending()
+            if now - p.get("created_at", 0) < 86400 and p.get("client_id") == client_id
+        ]
+        pending.append(
+            {
+                "state": state,
+                "verifier": verifier,
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "created_at": now,
+            }
+        )
+        _save_pending(pending)
+        httpd.known_states = {p["state"] for p in pending}
+        verifiers = {p["state"]: p["verifier"] for p in pending}
+
+        auth_url = md["authorization_endpoint"] + "?" + urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "scope": SCOPE,
+                "state": state,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": endpoint,
+            }
+        )
+
+        if print_url_only:
+            print(auth_url)
+            return {}
+
+        print(f"Mở browser để đăng nhập TikTok for Business (hết hạn sau {timeout}s)...")
+        print(f"Nếu browser không tự mở, dán URL này:\n{auth_url}\n")
+        if not no_browser:
+            webbrowser.open(auth_url)
+
+        deadline = time.time() + timeout
+        while True:
+            while httpd.callback_params is None and time.time() < deadline:
+                httpd.handle_request()
+            params = httpd.callback_params
+            httpd.callback_params = None
+            if params is None:
+                raise McpError("Hết thời gian chờ callback OAuth. Chạy lại: tiktok-ads-mcp login")
+            if httpd.callback_known:
+                break
+            print(
+                "⚠️  Bỏ qua callback của phiên login cũ (state không khớp), vẫn đang chờ...",
+                file=sys.stderr,
+            )
+        if params.get("error"):
+            raise McpError(
+                f"TikTok trả lỗi OAuth: {params['error'][0]} — {params.get('error_description', [''])[0]}"
+            )
+        used_state = params.get("state", [""])[0]
+        code = params.get("code", [""])[0]
+        if not code:
+            raise McpError("Callback không có authorization code")
+
+        try:
+            res = _http_form(
+                md["token_endpoint"],
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "client_id": client_id,
+                    "code_verifier": verifiers.get(used_state, verifier),
+                    "resource": endpoint,
+                },
+            )
+        finally:
+            _save_pending([p for p in pending if p["state"] != used_state])
+        if "access_token" not in res:
+            raise McpError(f"Đổi code lấy token thất bại: {json.dumps(res)[:300]}")
+
+        cred = {
+            "endpoint": endpoint,
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "token_endpoint": md["token_endpoint"],
+            "resource": endpoint,
+            "access_token": res["access_token"],
+            "refresh_token": res.get("refresh_token"),
+            "expires_at": time.time() + int(res.get("expires_in", 86399)),
+            "scope": res.get("scope", SCOPE),
+            "obtained_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if res.get("refresh_token_expires_in"):
+            cred["refresh_expires_at"] = time.time() + int(res["refresh_token_expires_in"])
+        save_credentials(cred)
+        return cred
+    finally:
+        httpd.server_close()
+
+
+def oauth_logout():
+    cred = load_credentials()
+    if not cred:
+        print("Chưa có token local để xoá.")
+        return
+    try:
+        md = discover(cred.get("endpoint", DEFAULT_ENDPOINT))
+        revoke = md.get("revocation_endpoint")
+        if revoke and cred.get("refresh_token"):
+            try:
+                _http_form(
+                    revoke,
+                    {
+                        "token": cred["refresh_token"],
+                        "token_type_hint": "refresh_token",
+                        "client_id": cred["client_id"],
+                    },
+                )
+            except McpError:
+                pass  # revoke lỗi không chặn logout local
+    except McpError:
+        pass
+    os.remove(CREDENTIALS_PATH)
+    print(f"Đã xoá {CREDENTIALS_PATH}")
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def _print_json(obj) -> None:
+    print(json.dumps(obj, indent=2, ensure_ascii=False))
+
+
+def _humanize(seconds: float) -> str:
+    if seconds <= 0:
+        return "đã hết hạn"
+    if seconds < 3600:
+        return f"{seconds/60:.0f} phút"
+    if seconds < 86400:
+        return f"{seconds/3600:.1f} giờ"
+    return f"{seconds/86400:.1f} ngày"
+
+
+def cmd_status(_args) -> int:
+    try:
+        cred = load_credentials()
+    except McpError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if not is_logged_in(cred):
+        _print_json(
+            {"logged_in": False, "credentials_path": CREDENTIALS_PATH,
+             "hint": "Chạy: tiktok-ads-mcp login"}
+        )
+        return 2
+    now = time.time()
+    _print_json(
+        {
+            "logged_in": True,
+            "endpoint": cred.get("endpoint"),
+            "scope": cred.get("scope"),
+            "access_token_expires_in": _humanize(cred.get("expires_at", 0) - now),
+            "refresh_token_expires_in": _humanize(cred.get("refresh_expires_at", 0) - now)
+            if cred.get("refresh_expires_at")
+            else "không rõ",
+            "credentials_path": CREDENTIALS_PATH,
+        }
+    )
+    return 0
+
+
+def _run_tool_call(client, tool: str, arguments: dict, raw=False):
+    result = client.call_tool(tool, arguments)
+    if raw or not isinstance(result, dict):
+        return result
+    content = result.get("content")
+    if isinstance(content, list) and content and all(c.get("type") == "text" for c in content):
+        texts = [c.get("text", "") for c in content]
+        parsed = []
+        for t in texts:
+            try:
+                parsed.append(json.loads(t))
+            except json.JSONDecodeError:
+                parsed = None
+                break
+        if parsed is not None:
+            return parsed[0] if len(parsed) == 1 else parsed
+    return result
+
+
+def _with_client(fn) -> int:
+    try:
+        client = open_session()
+        _print_json(fn(client))
+        return 0
+    except AuthRequired as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    except McpError as e:
+        print(f"Lỗi: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_whoami(args) -> int:
+    return _with_client(lambda c: _run_tool_call(c, "user_info_get", {}, raw=args.raw))
+
+
+def cmd_advertisers(args) -> int:
+    return _with_client(lambda c: _run_tool_call(c, "auth_advertiser_get", {}, raw=args.raw))
+
+
+def cmd_tools(args) -> int:
+    def run(client):
+        tools = client.list_tools()
+        if args.json:
+            return tools
+        return [
+            {"name": t.get("name"), "description": (t.get("description") or "").split("\n")[0][:140]}
+            for t in tools
+        ]
+
+    return _with_client(run)
+
+
+def _parse_params(args) -> dict:
+    sources = [bool(args.params), bool(args.params_file), bool(args.param)]
+    if sum(sources) > 1:
+        raise McpError("Chỉ dùng một trong: --params, --params-file, -p")
+    if args.params_file:
+        with open(args.params_file, encoding="utf-8") as f:
+            return json.load(f)
+    if args.params:
+        return json.loads(args.params)
+    out = {}
+    for item in args.param or []:
+        if "=" not in item:
+            raise McpError(f"-p cần dạng key=value, nhận được: {item}")
+        key, _, value = item.partition("=")
+        try:
+            out[key] = json.loads(value)
+        except json.JSONDecodeError:
+            out[key] = value
+    return out
+
+
+def cmd_call(args) -> int:
+    arguments = _parse_params(args)
+    return _with_client(lambda c: _run_tool_call(c, args.tool, arguments, raw=args.raw))
+
+
+def cmd_login(args) -> int:
+    try:
+        cred = oauth_login(
+            print_url_only=args.print_url, no_browser=args.no_browser, timeout=args.timeout
+        )
+        if args.print_url:
+            return 0
+        print(f"✅ Đã lưu token vào {CREDENTIALS_PATH} (scope: {cred.get('scope')})")
+        client = McpClient(cred["endpoint"], cred["access_token"])
+        client.initialize()
+        info = _run_tool_call(client, "user_info_get", {})
+        print("Kiểm tra user_info_get:")
+        _print_json(info)
+        return 0
+    except McpError as e:
+        print(f"Lỗi: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_logout(_args) -> int:
+    try:
+        oauth_logout()
+        return 0
+    except McpError as e:
+        print(f"Lỗi: {e}", file=sys.stderr)
+        return 1
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tiktok-ads-mcp",
+        description=(
+            "CLI gọi TikTok Ads official MCP (OAuth) — dùng qua terminal để "
+            "không phải nạp MCP vào agent mỗi phiên."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_login = sub.add_parser("login", help="Đăng nhập OAuth qua browser (chạy 1 lần)")
+    p_login.add_argument("--no-browser", action="store_true", help="Không tự mở browser, chỉ in URL")
+    p_login.add_argument("--print-url", action="store_true", help="Chỉ in authorize URL rồi thoát (debug)")
+    p_login.add_argument("--timeout", type=int, default=LOGIN_TIMEOUT, help="Giây chờ callback (mặc định 300)")
+    p_login.set_defaults(func=cmd_login)
+
+    sub.add_parser("status", help="Xem trạng thái token local").set_defaults(func=cmd_status)
+    sub.add_parser("logout", help="Xoá token local + revoke").set_defaults(func=cmd_logout)
+
+    p_whoami = sub.add_parser("whoami", help="Gọi user_info_get")
+    p_whoami.add_argument("--raw", action="store_true", help="In nguyên response MCP")
+    p_whoami.set_defaults(func=cmd_whoami)
+
+    p_adv = sub.add_parser("advertisers", help="Gọi auth_advertiser_get")
+    p_adv.add_argument("--raw", action="store_true", help="In nguyên response MCP")
+    p_adv.set_defaults(func=cmd_advertisers)
+
+    p_tools = sub.add_parser("tools", help="Liệt kê tools của official MCP")
+    p_tools.add_argument("--json", action="store_true", help="In full schema")
+    p_tools.set_defaults(func=cmd_tools)
+
+    p_call = sub.add_parser("call", help="Gọi tool bất kỳ của MCP")
+    p_call.add_argument("tool", help="Tên tool, ví dụ: auth_advertiser_get")
+    p_call.add_argument("--params", help="Tham số dạng JSON, ví dụ: '{\"advertiser_id\":\"7...\"}'")
+    p_call.add_argument("--params-file", help="Đọc tham số JSON từ file")
+    p_call.add_argument("-p", "--param", action="append", help="Tham số key=value (lặp lại được)")
+    p_call.add_argument("--raw", action="store_true", help="In nguyên response MCP")
+    p_call.set_defaults(func=cmd_call)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    try:  # để output hiện ngay cả khi bị pipe/redirect qua file (agent gọi hộ)
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nĐã huỷ.", file=sys.stderr)
+        sys.exit(130)

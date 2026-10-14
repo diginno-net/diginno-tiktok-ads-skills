@@ -66,6 +66,61 @@ Read-only smoke test trong Codex:
 4. `mcp__tiktok_ads.campaign_get`
 5. `mcp__tiktok_ads.report_integrated_get`
 
+## Giảm token load (enabled_tools)
+
+`tt-ads-mcp-flat` phơi bề mặt lớn của Business API nên nạp vào agent tốn context mỗi phiên.
+Nếu vẫn muốn giữ MCP trong Codex, giới hạn allow-list:
+
+```toml
+[mcp_servers.tiktok-ads]
+url = "https://business-api.tiktok.com/open_mcp/tt-ads-mcp-flat"
+enabled_tools = ["user_info_get", "auth_advertiser_get", "ad_get", "smart_plus_ad_get", "tt_video_info_get", "store_list_get", "store_product_get", "gmv_max_store_list_get", "gmv_max_identity_get", "gmv_max_exclusive_authorization_get"]
+```
+
+Đo bề mặt tool thật sau khi login: `tiktok-ads-mcp tools` (đếm số tool của server).
+
+## CLI `tiktok-ads-mcp` (không cần nạp MCP)
+
+CLI gọi cùng official MCP endpoint qua OAuth (Dynamic Client Registration + PKCE,
+tự refresh token). Dùng qua terminal nên không có tool definitions thường trực —
+chỉ tốn token cho output thật.
+
+Cài (symlink vào PATH) và login một lần, từ thư mục repo này:
+
+```bash
+ln -sf "$PWD/cli/tiktok-ads-mcp" ~/.local/bin/tiktok-ads-mcp
+tiktok-ads-mcp login
+```
+
+Dùng:
+
+```bash
+tiktok-ads-mcp status
+tiktok-ads-mcp whoami
+tiktok-ads-mcp advertisers
+tiktok-ads-mcp tools
+tiktok-ads-mcp call report_integrated_get --params '{"advertiser_id":"7...","report_type":"BASIC","data_level":"AUCTION_CAMPAIGN","dimensions":["campaign_id"],"metrics":["spend","impressions","clicks"],"start_date":"2026-10-01","end_date":"2026-10-13"}'
+```
+
+- Token lưu ở `~/.config/tiktok-ads-mcp/credentials.json` (0600), tách biệt token của Codex app.
+- Token endpoint dùng `token_endpoint_auth_method=none` (public client) + callback loopback port 47823.
+- Không in nội dung credentials/token ra output hay chat.
+
+## Xuất số thật từ Ads sang CSV
+
+- Xuất per-ad đúng cột bảng báo cáo (nguồn TikTok Ads):
+
+```bash
+python3 scripts/export-7-ngay-csv.py \
+  --advertiser-id <ID> --start YYYY-MM-DD --end YYYY-MM-DD \
+  --channel "<ten-kenh>" \
+  --out reports/private/<ten>.csv
+```
+
+- Dữ liệu khách luôn đặt trong `reports/private/` (đã gitignore — không commit CSV/ số thật vào git).
+- Template bảng báo cáo và cấu hình riêng cho từng khách để ở repo riêng, không đưa vào đây.
+  Repo này chỉ chứa công cụ generic, không có định danh khách.
+
 ## Safety
 
 - Không lưu token, app secret, bearer token, cookie, customer list, raw export nhạy cảm.
@@ -76,6 +131,8 @@ Read-only smoke test trong Codex:
 ## Structure
 
 ```text
+cli/
+  tiktok-ads-mcp
 skills/
   tiktok-ads-official/
   tiktok-ads-report-insight/
@@ -83,6 +140,7 @@ skills/
   tiktok-ads-launch-plan/
   tiktok-ads-creative-review/
 references/
+  faq.md
   source-analysis.md
   tiktok-report-metrics.md
   mutation-gate.md
@@ -91,6 +149,12 @@ scripts/
   install-to-opencode.sh
   validate-skills.sh
 ```
+
+## FAQ
+
+Xem [references/faq.md](references/faq.md): chưa được duyệt developer app vẫn lấy được data,
+phân biệt official Ads MCP vs RapidAPI, kiến trúc sync MCP → LarkBase, rủi ro OAuth token
+headless, vì sao số lệch Ads Manager (restate 3–7 ngày), chạy scheduler ở đâu.
 
 ## Case studies
 

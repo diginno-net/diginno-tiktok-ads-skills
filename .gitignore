@@ -12,5 +12,7 @@ node_modules/
 dist/
 build/
 tmp/
+__pycache__/
+*.pyc
 reports/private/
 .wrangler/
